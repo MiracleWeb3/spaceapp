@@ -91,7 +91,7 @@ jobs:
             spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}
           ready=0
           for _ in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:4911/readyz 2>/dev/null | grep -q 'ok:true'; then ready=1; break; fi
+            if curl -fsS http://127.0.0.1:4911/readyz 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.exit(d && JSON.parse(d).ok===true?0:1)}catch{process.exit(1)}})"; then ready=1; break; fi
             sleep 2
           done
           if [ "$ready" != 1 ]; then docker logs core; docker logs pg; exit 1; fi
@@ -123,14 +123,19 @@ jobs:
           until docker exec pg pg_isready -U spaceapp -d spaceapp; do sleep 2; done
           mkdir -p "$RUNNER_TEMP/smoke-secrets"
           printf 'postgresql://spaceapp:spaceapp@pg:5432/spaceapp' > "$RUNNER_TEMP/smoke-secrets/database-url"
+          # Apply migrations before the host starts: browser-host-main queries
+          # active sessions at boot and exits if the schema is missing.
+          # --entrypoint: the image's own entrypoint always execs browser-host-main
+          # and ignores any command we pass after it.
+          docker run --rm --network spaceapp-smoke --entrypoint node \
+            -e SPACE_DATABASE_URL=postgresql://spaceapp:spaceapp@pg:5432/spaceapp \
+            spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }} \
+            packages/db/dist/migrate.js
           docker run -d --name browser --network spaceapp-smoke \
             -v "$RUNNER_TEMP/smoke-secrets:/run/secrets:ro" \
             -e SPACE_RUNTIME_STORE=postgres \
             -e SPACE_BROWSER_HOST_SOCKET=/run/spaceapp-browser/browser-host.sock \
             spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}
-          # The browser image carries the db workspace, so it can apply migrations itself.
-          docker exec -e SPACE_DATABASE_URL=postgresql://spaceapp:spaceapp@pg:5432/spaceapp \
-            browser node packages/db/dist/migrate.js
           ready=0
           for _ in $(seq 1 60); do
             if docker exec browser node -e "const{execFileSync}=require('node:child_process');const out=execFileSync('ps',['-o','args=','-C','node']);process.stdout.write(out.toString())" 2>/dev/null | grep -q browser-host-main.js; then ready=1; break; fi
